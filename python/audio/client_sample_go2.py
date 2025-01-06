@@ -10,6 +10,7 @@ import time
 import threading
 import re
 
+from openai import AzureOpenAI
 import numpy as np
 import soundfile as sf
 from azure.core.credentials import AzureKeyCredential
@@ -25,6 +26,10 @@ import json
 import os
 import sys
 import webrtcvad
+
+import whisper
+import pyaudio
+import torch
 
 import paho.mqtt.client as mqtt
 
@@ -55,6 +60,19 @@ BROKER_ADDRESS = "broker.mqtt.cool"  # Public test broker
 PORT = 1883  # Default MQTT port
 TOPIC = "test/topic"
 MESSAGE = "Hello, MQTT!"
+
+api_type: str = "azure"
+api_key = ""
+api_base = ""
+model = "gpt-4o"
+api_version = "2024-05-01-preview"
+
+client = AzureOpenAI(
+        api_key=api_key,
+        api_version=api_version,
+        base_url=f"{api_base}/openai/deployments/{model}",
+)
+
 def on_connect(client, userdata, flags, rc):
     """Callback function when the client connects to the broker."""
     if rc == 0:
@@ -179,7 +197,7 @@ def listen_for_keyword(keyword="hello"):
             print(f"Error: {e}")
 
 
-# Function to transcribe speech
+# Function to transcribe speech (google)
 def transcribe_speech():
     recognizer = sr.Recognizer()
     print("Listening for your question...")
@@ -197,6 +215,79 @@ def transcribe_speech():
     except Exception as e:
         print(f"Error: {e}")
     return None
+
+# Function to transcribe speech with (whisper edge)
+def transcribe_whisper(model):    
+
+    # VAD setup
+    vad = webrtcvad.Vad()
+    vad.set_mode(3)  # Set VAD aggressiveness: 0-3
+
+    # Audio settings
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 1
+    RATE = 16000  # Must be one of the supported rates
+    CHUNK = int(RATE * 0.02)  # 20ms chunks
+
+    # Silence detection settings
+    SILENCE_THRESHOLD = 30  # Number of consecutive silent chunks (~200ms)
+
+    # Initialize PyAudio
+    audio = pyaudio.PyAudio()
+
+    stream = audio.open(format=FORMAT, channels=CHANNELS,
+                        rate=RATE, input=True,
+                        frames_per_buffer=CHUNK)
+
+    print("Listening with VAD...")
+    time.sleep(1.5)
+    start_time = time.time()
+    
+
+    audio_buffer = []
+    is_speaking = False
+    silence_count = 0
+
+    try:
+        while True:
+            # Read a 20ms chunk
+            audio_data = stream.read(CHUNK, exception_on_overflow=False)
+            
+            # Check if it's speech
+            if vad.is_speech(audio_data, RATE):
+                audio_buffer.append(audio_data)
+                is_speaking = True
+                silence_count = 0  # Reset silence count when speech is detected
+            elif is_speaking:
+                silence_count += 1
+
+                # Check if silence duration exceeds threshold
+                if silence_count > SILENCE_THRESHOLD:
+                    print("Processing...")
+                    start_time = time.time()
+
+                    # Combine all buffered audio into a single array
+                    combined_audio = b''.join(audio_buffer)
+                    audio_buffer = []  # Reset buffer
+
+                    # Convert to NumPy array for Whisper
+                    np_audio = np.frombuffer(combined_audio, dtype=np.int16).astype(np.float32) / 32768.0
+
+                    # Transcribe with Whisper
+                    result = model.transcribe(np_audio, fp16=True)
+                    print(f"Transcription: {result['text']}")  
+                    end_time = time.time() 
+                    
+                    time_difference = end_time - start_time
+                    print(f"Whisper Time taken: {time_difference} seconds")                  
+                    is_speaking = False
+                    silence_count = 0  # Reset silence count
+                    return result['text']
+    except KeyboardInterrupt:
+        print("Stopping...")
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
 
 
 # Function to map GPT-4 response to SPORT_CMD
@@ -361,7 +452,7 @@ async def send_audio_from_microphone_fixed(client: RTClient, capture_duration=3)
     global start_time  # Use the global keyword to modify the variable
 
     print("Starting microphone stream...")
-    record_audio("Transcript_detection.wav", duration=3)
+    #record_audio("Transcript_detection.wav", duration=3)
     start_time = time.time()
     with sd.InputStream(
         samplerate=sample_rate, channels=1, dtype="int16", blocksize=samples_per_chunk
@@ -591,6 +682,86 @@ async def receive_messages(client: RTClient, out_dir: str):
         receive_events(client, out_dir),
     )
 
+# Function to get GPT-4 response
+def get_gpt4_response(prompt):
+    """
+    Use GPT-4 to map the user input directly to the SPORT_CMD descriptions.
+    """
+    system_prompt = (
+         "You are an assistant for controlling a robot and do not response more than 10 words. The robot can move in different directions.Follow these rules strictly : "
+        "First, You MUST translate all the user input into english ,even if the input is in Chinese or any other language.\n"
+        "Translate the user input into movement commands with the following mappings:\n"
+        "1. 'forward' means move along the positive x-axis (x: +value)\n"
+        "2. 'backward' means move along the negative x-axis (x: -value)\n"
+        "3. 'left' means move along the negative y-axis (y: -value)\n"
+        "4. 'right' means move along the positive y-axis (y: +value)\n"
+        "5. 'turn left' means rotate the robot counterclockwise (z: +value)\n"
+        "6. 'turn right' means rotate the robot clockwise (z: -value)\n"
+        "The movement values should be between -1 and 1 for each axis.If user input including numbers, please use +0.1,-0.1 as the unit, if not, just use +1,-1 instead \n"
+        "Use 0 for axes not involved in the movement.The robot should only move in response to these directions.\n"
+        "If the user does not directly ask for a movement, use the predefined list of commands below:\n"
+        f"{', '.join(SPORT_CMD.values())}.\n"
+        "Your response must always be in strict JSON format as shown: {\"x\": value, \"y\": value, \"z\": value} for movement commands. "
+        "# Examples- \n"
+        "**Input:** \"向前\"    **Output:** {\"x\": 1, \"y\": 0, \"z\": 0}\n"
+        "**Input:** \"向右移動\"  **Output:** {\"x\": 0, \"y\": 1, \"z\": 0}\n"
+        "**Input:** \"move forward please with 3 steps\"  **Output:** {\"x\": 0.3, \"y\": 0, \"z\": 0}\n"
+        "**Input:** \"move left\"  **Output:** {\"x\": 0, \"y\": -1, \"z\": 0}\n"
+        "If no movement is detected, respond with the appropriate SPORT_CMD command."
+        "# Examples- \n"
+        "**Input:** \"請坐下\"    **Output:** Sit\n"
+        "**Input:** \"比個愛心手勢\"  **Output:**  FingerHeart\n"
+        "If no movement is detected, respond with the appropriate SPORT_CMD command"
+        "If no appropriate SPORT_CMD command, just chat with user input "
+    )
+
+    print("Starting to send transcript to GPT4")
+    start_time = time.time()
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2000
+        )
+        end_time = time.time()        
+        # Extract and clean the response
+        response_text = response.choices[0].message.content.strip()
+        time_difference = end_time - start_time
+        print(f"Time taken: {time_difference} seconds")
+        print(response_text)
+        
+        # Check if the response is related to movement (in {x, y, z} format)
+        if "{" in response_text and "}" in response_text:
+            print("move command")
+            # Check if it contains a valid direction command like {'x': 0.22, 'y': -0.22, 'z': 0}
+            try:
+                # Try parsing the response as JSON-like format for movement
+                move_command = json.loads(response_text)
+                
+                print(move_command)
+                if 'x' in move_command and 'y' in move_command and 'z' in move_command:
+                    return move_command  # Return the movement command if valid
+            except Exception as e:
+                print(f"Error parsing move command: {e}")
+        
+        # If no valid move command, map to SPORT_CMD
+        print("No movement command detected, mapping to SPORT_CMD...")
+        
+        # Get the closest match from SPORT_CMD
+        for cmd_id, cmd_name in SPORT_CMD.items():
+            if cmd_name.lower() in response_text.lower():
+                print(f"Matched Command: {cmd_name} (ID: {cmd_id})")
+                return cmd_name  # Return the SPORT_CMD name
+        
+        # If no match is found, return a default response
+        return "Sorry, I couldn't recognize the command."
+    except Exception as e:
+        print(f"Error communicating with OpenAI: {e}")
+        return None
+    
 
 async def run(client: RTClient, audio_file_path: str, out_dir: str):
     #speak("Yes,I am here.")
@@ -668,7 +839,7 @@ def keyword_wake():
     recognizer = speechsdk.KeywordRecognizer(audio_config=audio_config)
 
     print(f"Listening continuously for the keyword: '{keyword}'... (Press Ctrl+C to stop)")
-    record_audio("keyword_detection_clean.wav", duration=3)
+    #record_audio("keyword_detection_clean.wav", duration=3)
 
     try:
         while True:
@@ -699,18 +870,23 @@ if __name__ == "__main__":
     # Connect to the MQTT broker
     print(f"Connecting to MQTT broker at {BROKER_ADDRESS}:{PORT}...")
     mqtt_bridge.connect(BROKER_ADDRESS, PORT, keepalive=60)
+    # Load Whisper model
+    # Check if CUDA is available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(device)
+    model = whisper.load_model("base").to(device)
 
 
     load_dotenv()
     if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <out_dir> [azure|openai]")
-        print("If the third argument is not provided, it will default to azure")
+        print(f"Usage: python {sys.argv[0]} <out_dir> [whisper|gpt4o]")
+        print("If the third argument is not provided, it will default to whisper")
         sys.exit(1)
 
     #file_path = sys.argv[1]
     file_path = ""
     out_dir = sys.argv[1]
-    provider = sys.argv[2] if len(sys.argv) == 3 else "azure"
+    provider = sys.argv[2] if len(sys.argv) == 3 else "whisper"
 
     #if not os.path.isfile(file_path):
     #    print(f"File {file_path} does not exist")
@@ -720,24 +896,18 @@ if __name__ == "__main__":
         print(f"Directory {out_dir} does not exist")
         sys.exit(1)
 
-    if provider not in ["azure", "openai"]:
-        print(f"Provider {provider} needs to be one of 'azure' or 'openai'")
+    if provider not in ["whisper", "gpt4o"]:
+        print(f"Provider {provider} needs to be one of 'whisper' or 'gpt4o'")
         sys.exit(1)
 
-    while True:
-        # Step 1: Listen for the keyword
-        #listen_for_keyword(keyword="hello")
-        keyword_wake()
-        print("Starting new recording session...")
-        asyncio.run(with_azure_openai(file_path, out_dir))
-        print("Recording session ended. Waiting before restarting...")
-
-        # Step 2: Transcribe speech after the keyword is detected
-        #user_input = transcribe_speech()
-
-        # Step 3: Get GPT-4 response
-        """ if user_input:
-            print("Sending to GPT-4...")
+    if provider == "whisper":
+        print("Whisper Mode")
+        print("Sending to GPT-4...")
+        while True:
+            keyword_wake()
+            user_input = transcribe_whisper(model)
+            if not user_input:
+                continue
             gpt4_response = get_gpt4_response(user_input)
             if gpt4_response:
                 print("GPT-4 Response:")
@@ -756,10 +926,13 @@ if __name__ == "__main__":
             else:
                 print("No response from GPT-4.")
                 speak("Sorry, I couldn't get a response. Please try again.")
-        else:
-            print("No valid input detected.") """
-
-    if provider == "azure":
-        asyncio.run(with_azure_openai(file_path, out_dir))
-    else:
-        asyncio.run(with_openai(file_path, out_dir))
+    
+    else : 
+        print("GPT4o realtime Mode")
+        while True:
+            # Step 1: Listen for the keyword
+            #listen_for_keyword(keyword="hello")
+            keyword_wake()
+            print("Starting new recording session...")
+            asyncio.run(with_azure_openai(file_path, out_dir))
+            print("Recording session ended. Waiting before restarting...")
